@@ -21,6 +21,9 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+import torch.optim as optim
+import torch.nn.functional as F
+
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -45,6 +48,7 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
+        self.network_fn = MappingNetwork().cuda()
 
 
     def __init__(self, sh_degree, optimizer_type="default"):
@@ -65,6 +69,7 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+
     def capture(self):
         return (
             self.active_sh_degree,
@@ -78,6 +83,8 @@ class GaussianModel:
             self.xyz_gradient_accum,
             self.denom,
             self.optimizer.state_dict(),
+            self.optimizer2.state_dict(),
+            
             self.spatial_lr_scale,
         )
     
@@ -98,6 +105,8 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        self.optimizer2.load_state_dict(opt_dict)
+        
 
     @property
     def get_scaling(self):
@@ -145,7 +154,49 @@ class GaussianModel:
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+            
+    '''The function of generating from point cloud is under testing...'''        
+    # def fetchPly(self):
+    #     plydata = PlyData.read('/home/eeczwen/gaussian-splatting-rf/data/lab.ply')
+    #     vertices = plydata['vertex']
+    #     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+    #     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    #     # normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    #     return BasicPointCloud(points=positions, colors=colors)
+    
+    def gaussian_init(self):
+        # 随机生成服从高斯分布的张量
+        fused_point_cloud = torch.randn((20000,3)).float().cuda()
+        fused_point_cloud = (fused_point_cloud*10)
+        fused_color = RGB2SH(torch.rand((20000,3)).float().cuda())
 
+        # pcd = self.fetchPly()
+        # fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        # fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda() 
+        features[:, :3, 0 ] = fused_color 
+        features[:, 3:, 1:] = 0.0
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.pretrained_exposures = None
+        exposure = torch.eye(3, 4, device="cuda")[None].repeat(1, 1, 1)
+        
+        self._exposure = nn.Parameter(exposure.requires_grad_(True))
+    
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -209,7 +260,20 @@ class GaussianModel:
                                                         lr_delay_steps=training_args.exposure_lr_delay_steps,
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
+        params_mlp = list(self.network_fn.parameters())
 
+        ''' You may need to modify the parameters here for different data sizes.'''
+        self.optimizer2 = torch.optim.Adam(params_mlp, lr=float(8e-4),
+                                          weight_decay=float(5e-5),
+                                          betas=(0.9, 0.999)) 
+        self.cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=self.optimizer2,
+                                                                        T_max=float(200000), eta_min=float(1e-6),
+                                                                        last_epoch=-1)
+
+                                                                    
+                                                                    
+                                                                    
+        
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         if self.pretrained_exposures is None:
@@ -471,3 +535,152 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def dist_signal_mapping(self, tx, r_o):
+        r_o = torch.tensor(r_o).cuda()
+        pts = self._xyz
+        view = self._xyz - tx
+        tx = tx.repeat(pts.size(0), 1)
+        raw = self.network_fn(pts, tx, view)
+        path = torch.norm(self._xyz - r_o)
+        path_loss = 0.025/path
+        att_a, att_p, s_a, s_p = raw[...,0], raw[...,1], raw[...,2], raw[...,3] # [batchsize]
+        att_p, s_p = torch.sigmoid(att_p)*np.pi*2, torch.sigmoid(s_p)*np.pi*2
+        att_a, s_a = abs(F.leaky_relu(att_a)), abs(F.leaky_relu(s_a))    
+        s_p = torch.exp(1j*s_p) 
+        att_p = torch.exp(1j*att_p) 
+        s_a = s_a.unsqueeze(1)
+        att_a = att_a.unsqueeze(1)
+        att_p = att_p.unsqueeze(1)
+        
+        '''Different from the paper, opacity is used here to replace the attenuation component of the network output.'''
+        signal = s_a*att_a/path_loss
+        att = att_a*att_p
+        # signal = signal*att
+        signal = torch.cat((signal, signal, signal),-1)
+        self._features_dc = signal.unsqueeze(-2)
+        # self._opacity = att
+ 
+
+        
+class Embedder():
+    """positional encoding
+    """
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.create_embedding_fn()
+
+    def create_embedding_fn(self):
+        embed_fns = []
+        d = self.kwargs['input_dims']    # input dimension of gamma
+        out_dim = 0
+
+        if self.kwargs['include_input']:
+            embed_fns.append(lambda x : x)
+            out_dim += d
+
+        max_freq = self.kwargs['max_freq_log2']    # L-1, 10-1 by default
+        N_freqs = self.kwargs['num_freqs']         # L
+
+
+        if self.kwargs['log_sampling']:
+            freq_bands = 2.**torch.linspace(0., max_freq, steps=N_freqs)  #2^[0,1,...,L-1]
+        else:
+            freq_bands = torch.linspace(2.**0., 2.**max_freq, steps=N_freqs)
+
+        for freq in freq_bands:
+            for p_fn in self.kwargs['periodic_fns']:
+                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+                out_dim += d
+
+        self.embed_fns = embed_fns
+        self.out_dim = out_dim
+
+    def embed(self, inputs):
+        """return: gamma(input)
+        """
+        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+    
+def get_embedder(multires, is_embeded=True, input_dims=3):
+
+    if is_embeded == False:
+        return nn.Identity(), input_dims
+
+    embed_kwargs = {
+                'include_input' : True,
+                'input_dims' : input_dims,
+                'max_freq_log2' : multires-1,
+                'num_freqs' : multires,
+                'log_sampling' : True,
+                'periodic_fns' : [torch.sin, torch.cos],
+    }
+
+    embedder_obj = Embedder(**embed_kwargs)
+    embed = lambda x, eo=embedder_obj : eo.embed(x)
+    return embed, embedder_obj.out_dim
+
+    
+class MappingNetwork(nn.Module):
+
+    def __init__(self, D=8, W=128, skips=[4],
+                 input_dims={'pts':3, 'view':3, 'tx':3},
+                 multires = {'pts':10, 'view':10, 'tx':10},
+                 is_embeded={'pts':True, 'view':True, 'tx':True},
+                 attn_output_dims=2, sig_output_dims=2):
+
+        super().__init__()
+        self.skips = skips
+       
+        # set positional encoding function
+        self.embed_pts_fn, input_pts_dim = get_embedder(multires['pts'], is_embeded['pts'], input_dims['pts'])
+        self.embed_view_fn, input_view_dim = get_embedder(multires['view'], is_embeded['view'], input_dims['view'])
+        self.embed_tx_fn, input_tx_dim = get_embedder(multires['tx'], is_embeded['tx'], input_dims['tx'])
+
+        ## attenuation network
+        self.attenuation_linears = nn.ModuleList(
+            [nn.Linear(input_pts_dim, W)] +
+            [nn.Linear(W, W) if i not in skips else nn.Linear(W + input_pts_dim, W)
+             for i in range(D - 1)]
+        )
+
+        ## signal network
+        self.signal_linears = nn.ModuleList(
+            [nn.Linear(input_view_dim + input_tx_dim + W, W)] +
+            [nn.Linear(W, W//2)]
+        )
+
+        ## output head, 2 for amplitude and phase
+        self.attenuation_output = nn.Linear(W, attn_output_dims)
+        self.feature_layer = nn.Linear(W, W)
+        self.signal_output = nn.Linear(W//2, sig_output_dims)
+
+
+    def forward(self, pts, view, tx):
+
+        # position encoding
+        pts = self.embed_pts_fn(pts).contiguous()
+        view = self.embed_view_fn(view).contiguous()
+        tx = self.embed_tx_fn(tx).contiguous()
+        shape = pts.shape
+        pts = pts.view(-1, list(pts.shape)[-1])
+        view = view.view(-1, list(view.shape)[-1])
+        tx = tx.view(-1, list(tx.shape)[-1])
+
+        x = pts
+        for i, layer in enumerate(self.attenuation_linears):
+            x = F.relu(layer(x))
+            if i in self.skips:
+                x = torch.cat([pts, x], -1)
+
+        attn = self.attenuation_output(x)    # (batch_size, 2)
+        feature = self.feature_layer(x)
+        x = torch.cat([feature, view, tx], -1)
+
+        for i, layer in enumerate(self.signal_linears):
+            x = F.relu(layer(x))
+    
+        signal = self.signal_output(x)    #[batchsize, n_samples, 2]
+
+        outputs = torch.cat([attn, signal], -1).contiguous()    # [batchsize, n_samples, 4]
+        return outputs.view(shape[:-1]+outputs.shape[-1:])
+    

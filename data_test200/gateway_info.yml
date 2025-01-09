@@ -1,0 +1,4 @@
+dataset_name: s23
+gateway1:
+  position: [5.0, 0.26, 0]
+  orientation:  [ 0.51291602, -0.48674136, -0.48674136,  0.51291602]  # quaternion
