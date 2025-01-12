@@ -155,9 +155,9 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
             
-    '''The function of generating from point cloud is under testing...'''        
+    '''The function of generating from point cloud '''        
     # def fetchPly(self):
-    #     plydata = PlyData.read('/home/eeczwen/gaussian-splatting-rf/data/lab.ply')
+    #     plydata = PlyData.read('./data/lab.ply')
     #     vertices = plydata['vertex']
     #     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     #     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
