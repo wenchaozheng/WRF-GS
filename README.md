@@ -33,7 +33,7 @@ More datasets can be found [here](https://github.com/XPengZhao/NeRF2?tab=readme-
 
 **Note:** As the amount of training data changes, you may need to adjust the total `iterations (./arguments/__init__.py)` and `learning rate (./scene/gaussian_model.py)`.
 
-**Upcoming revision:** The issue of frequently adjusting model parameters due to changes in data volume has now been resolved. The new model structure and methods will be updated in the near future or in [subsequent work](https://github.com/wenchaozheng/WRF-GSplus). (Currently, testing shows an improvement of approximately 8% to 10% in SSIM values; stay tuned for updates).
+**Upcoming revision:** The issue of frequently adjusting model parameters due to changes in data volume has now been resolved. The new model structure [WRF-GS+](https://github.com/wenchaozheng/WRF-GSplus) will be updated in the near future. (Currently, testing shows an improvement of approximately 8% to 10% in SSIM values; stay tuned for updates).
 ## To-Do List
 - [ ] Implementation on [gsplat](https://github.com/nerfstudio-project/gsplat) to speed up the code.
 - [ ] Release more case study code.
