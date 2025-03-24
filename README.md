@@ -46,7 +46,7 @@ If you find this work useful in your research, please cite:
 @article{wen2024wrf,
   title={WRF-GS: Wireless Radiation Field Reconstruction with 3D Gaussian Splatting},
   author={Wen, Chaozheng and Tong, Jingwen and Hu, Yingdong and Lin, Zehong and Zhang, Jun},
-  journal={arXiv preprint arXiv:2412.04832},
+  journal={arXiv preprint arXiv:2412.04832v2},
   year={2024}
 }
 ```
